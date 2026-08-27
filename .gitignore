@@ -1,0 +1,28 @@
+# Secrets — never commit real API keys or admin tokens
+.env
+.env.local
+*.local
+
+# Docker CLI config (writable dir for compose plugin on ZimaOS et al.)
+.docker/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Node / Vite (web/)
+web/node_modules/
+web/dist/
+web/.svelte-kit/
+web/.vite/
+web/*.local
+
+# macOS / editor cruft
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json

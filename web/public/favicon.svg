@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Geet-Hub favicon. Same palette / concept as the iOS app icon: teal
+     accent background, off-white vinyl disc, teal center label, dark spindle.
+     Simplified for small sizes (no grooves — they'd be invisible at 16×16). -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="6" fill="#12798F"/>
+  <circle cx="16" cy="16" r="11" fill="#F4F4F2"/>
+  <circle cx="16" cy="16" r="4.5" fill="#12798F"/>
+  <circle cx="16" cy="16" r="0.9" fill="#14161A"/>
+</svg>

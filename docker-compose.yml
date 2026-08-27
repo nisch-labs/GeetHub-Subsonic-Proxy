@@ -1,0 +1,28 @@
+services:
+  subsonic-proxy:
+    build: .
+    image: subsonic-proxy
+    container_name: subsonic-proxy
+    # Host networking (same pattern as dedup-watcher): reach Navidrome and
+    # Antra on 127.0.0.1 without fragile container IPs. Serves on :4544.
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      # Point this at the same music dir Navidrome + Antra already use — the
+      # YouTube-audio fallback writes into `${FALLBACK_DIR}` under here.
+      # Override MUSIC_DIR in a local `.env` (see .env.example).
+      - ${MUSIC_DIR:-./music}:/music:rw
+    environment:
+      NAVIDROME_URL: http://127.0.0.1:4533
+      ANTRA_URL: http://127.0.0.1:8288
+      LISTEN_PORT: 4544
+      YT_SEARCH_LIMIT: 5
+      MAGIC_PLAYLIST_NAME: Download via Antra
+      # Antra-first path sources a clean Deezer link in this format.
+      ANTRA_SOURCE: deezer
+      ANTRA_FORMAT: mp3
+      ANTRA_FOLDER: ""
+      # Where the YouTube-audio fallback writes when Antra can't source it.
+      FALLBACK_DIR: /music/YouTube
+      # Phase 4 only (kept in .env on the server, chmod 600 — never committed):
+      ANTRA_ADMIN_KEY: ${ANTRA_ADMIN_KEY:-}
