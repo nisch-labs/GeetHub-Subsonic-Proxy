@@ -356,6 +356,11 @@
                 </button>
               </li>
             {/each}
+            {#if $player.radioLoading}
+              <li class="radio-loading retro retro-sm retro-light retro-graphite">
+                <span class="pulse">◉</span> Building radio…
+              </li>
+            {/if}
           </ol>
         {/if}
       {:else}
@@ -637,6 +642,9 @@
   .tab.on { color: var(--accent); border-bottom-color: var(--accent); }
   .panel { flex: 1; overflow-y: auto; }
   .empty { padding: 30px 20px; text-align: center; }
+  .radio-loading { padding: 12px 20px; display: flex; align-items: center; gap: 8px; }
+  .radio-loading .pulse { color: var(--accent, #e11d48); animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
 
   .queue { list-style: none; margin: 0; padding: 4px 0; display: flex; flex-direction: column; }
   .queue li { border-bottom: 1px solid var(--hairline); }

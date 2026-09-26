@@ -40,6 +40,10 @@ interface PlayerState {
   // Radio: when on, natural queue-end triggers a fetch of similar tracks
   // seeded from the currently-playing song so playback never dries up.
   radioMode: boolean
+  // True while a top-up fetch is in flight — the UI shows a placeholder in
+  // Up Next so the ~1–4s cold hit against MusicBrainz + ListenBrainz feels
+  // intentional instead of broken.
+  radioLoading: boolean
 }
 
 const RECENTS_KEY = 'geethub.recentlyPlayed'
@@ -120,6 +124,7 @@ const initial: PlayerState = {
   volume: loadVolume(),
   deviceId: loadDeviceId(), devices: [],
   radioMode: loadRadio(),
+  radioLoading: false,
 }
 
 const store = writable<PlayerState>(initial)
@@ -490,6 +495,7 @@ async function topUpRadio() {
   const client = get(session).client
   if (!seed || !client) return
   radioTopUpInFlight = true
+  store.update((st) => ({ ...st, radioLoading: true }))
   try {
     const similar = await client.similarSongs(seed.id, RADIO_BATCH)
     if (!similar || similar.length === 0) return
@@ -508,7 +514,10 @@ async function topUpRadio() {
       return { ...st, queue }
     })
   } catch (_) { /* transient — try again on the next transition */ }
-  finally { radioTopUpInFlight = false }
+  finally {
+    radioTopUpInFlight = false
+    store.update((st) => ({ ...st, radioLoading: false }))
+  }
 }
 
 function toggleRadio() {

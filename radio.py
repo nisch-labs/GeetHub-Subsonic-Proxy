@@ -10,6 +10,8 @@ If the seed has no MBID or the resolution rate is too low, the caller falls
 back to Navidrome's own artist-based getSimilarSongs2.
 """
 import os
+import time
+import asyncio
 import logging
 
 import httpx
@@ -22,6 +24,11 @@ log = logging.getLogger("subsonic-proxy.radio")
 # back to Navidrome's artist-radio — keeps the queue from feeling sparse.
 RADIO_MIN_RESULTS = int(os.environ.get("RADIO_MIN_RESULTS", "10"))
 RADIO_ENABLED = os.environ.get("RADIO_ENABLED", "true").strip().lower() != "false"
+# Result cache: seed_id → (expires_at_epoch, songs). Repeated toggles of Radio
+# on the same track (common while testing / when a track loops) skip the whole
+# MB + LB + N×search3 dance.
+RADIO_CACHE_TTL = int(os.environ.get("RADIO_CACHE_TTL", "300"))
+_RESULT_CACHE: dict[str, tuple[float, list[dict]]] = {}
 
 # Subsonic auth params we pass through when talking to Navidrome on the caller's
 # behalf. `f` is forced to json in our own requests regardless of what the
@@ -99,6 +106,15 @@ async def build_radio(client: httpx.AsyncClient, base: str, query_params,
         debug["skipped"] = "RADIO_ENABLED=false"
         return [], debug
 
+    # Serve from cache if we've built radio for this seed recently. Toggling
+    # Radio off/on, replaying a track, or two clients asking together should
+    # not each pay the full MB+LB+search-3 cost.
+    cached = _RESULT_CACHE.get(seed_id)
+    if cached and cached[0] > time.time():
+        songs = cached[1][:count]
+        debug.update(cached=True, resolved=len(songs))
+        return songs, debug
+
     auth = _auth_from(query_params)
     seed = await _get_song(client, base, auth, seed_id)
     if not seed:
@@ -143,14 +159,20 @@ async def build_radio(client: httpx.AsyncClient, base: str, query_params,
         debug["skipped"] = "no ListenBrainz similarities for any candidate MBID"
         return [], debug
 
-    songs: list[dict] = []
-    seen_ids: set[str] = set()
-    seen_ids.add(seed_id)  # never re-queue the seed itself
+    # Resolve every rec in parallel — this was the bottleneck. Cap the batch
+    # at 2x the desired count so we don't hammer Navidrome for 60 lookups when
+    # we only need 20 to succeed. LB returns rows in score order so trimming
+    # from the top keeps the highest-quality matches.
+    batch = recs[: max(count * 2, count + 10)]
+    search_tasks = [
+        _search_one(client, base, auth, f"{rec['artist']} {rec['title']}")
+        for rec in batch
+    ]
+    all_candidates = await asyncio.gather(*search_tasks)
 
-    for rec in recs:
-        # Search by "<artist> <title>" first — Navidrome doesn't index by MBID.
-        candidates = await _search_one(client, base, auth,
-                                       f"{rec['artist']} {rec['title']}")
+    songs: list[dict] = []
+    seen_ids: set[str] = {seed_id}  # never re-queue the seed itself
+    for rec, candidates in zip(batch, all_candidates):
         match = _best_match(candidates, rec["artist"], rec["title"])
         if not match:
             continue
@@ -168,4 +190,5 @@ async def build_radio(client: httpx.AsyncClient, base: str, query_params,
         # with a two-song radio.
         debug["skipped"] = f"only {len(songs)} local matches (< {RADIO_MIN_RESULTS})"
         return [], debug
+    _RESULT_CACHE[seed_id] = (time.time() + RADIO_CACHE_TTL, songs)
     return songs, debug
