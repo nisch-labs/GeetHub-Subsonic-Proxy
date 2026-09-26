@@ -141,9 +141,15 @@ export interface Device {
 }
 
 export interface DeviceCommand {
-  type: 'play' | 'pause'
+  type: 'play' | 'pause' | 'transferTo'
   song: DeviceSong | null
   position: number | null
+  /** Full up-next list at the moment of transfer (newer clients only). */
+  queue?: DeviceSong[]
+  /** Position of `song` within `queue`. */
+  index?: number
+  /** For `transferTo`: the device that's asking to receive playback. */
+  target_id?: string
 }
 
 /** Virtual-track source, encoded as an id prefix by the proxy. */
@@ -157,4 +163,14 @@ export function virtualSource(id: string): VirtualSource | null {
 
 export function shortLabel(source: VirtualSource): string {
   return source === 'youtubeMusic' ? 'YT Music' : 'YT'
+}
+
+/** The bare YouTube video id behind a virtual track, or null for a real track.
+ * Both `yt-<videoId>` and `ytm-<videoId>` carry a real YouTube video id
+ * (YT Music songs are hosted on YouTube's video infrastructure), so both are
+ * embeddable in the IFrame player. */
+export function youtubeVideoId(id: string): string | null {
+  if (id.startsWith('ytm-')) return id.slice(4)
+  if (id.startsWith('yt-')) return id.slice(3)
+  return null
 }

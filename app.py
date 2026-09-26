@@ -28,8 +28,13 @@ import subsonic
 import antra
 import deezer
 import devices as devices_registry
+import guest as guest_sessions
+import listenbrainz
+import radio
 
 NAVIDROME_URL = os.environ.get("NAVIDROME_URL", "http://127.0.0.1:4533").rstrip("/")
+NAVIDROME_GUEST_USER = os.environ.get("NAVIDROME_USER", "").strip()
+NAVIDROME_GUEST_PASS = os.environ.get("NAVIDROME_PASS", "").strip()
 ANTRA_URL = os.environ.get("ANTRA_URL", "http://127.0.0.1:8288").rstrip("/")
 YT_SEARCH_LIMIT = int(os.environ.get("YT_SEARCH_LIMIT", "8"))
 MAGIC_PLAYLIST = os.environ.get("MAGIC_PLAYLIST_NAME", "Download via Antra").strip().lower()
@@ -467,19 +472,27 @@ async def api_devices_list(request: Request):
 
 @app.post("/api/devices/{target_id}/transfer")
 async def api_devices_transfer(target_id: str, request: Request):
-    """Transfer playback to `target_id`. Body: {song, position, source_id?}.
-    Queues a `play` command for the target and a `pause` command for the
-    source (if provided). Returns 404 if the target isn't registered."""
+    """Transfer playback to `target_id`. Body: {song, position, source_id?,
+    queue?, index?}. Queues a `play` command for the target and a `pause`
+    command for the source (if provided). Returns 404 if the target isn't
+    registered. `queue` + `index` are optional — newer clients send the full
+    up-next list so it survives the transfer; older clients just send `song`.
+    """
     try:
         body = await request.json()
     except Exception:
         body = {}
     user = _user_from(request)
+    queue = body.get("queue")
+    if not isinstance(queue, list):
+        queue = None
     ok = devices_registry.transfer(
         user, target_id,
         source_id=(body.get("source_id") or "").strip() or None,
         song=body.get("song"),
         position=body.get("position") or 0,
+        queue=queue,
+        index=body.get("index"),
     )
     if not ok:
         raise HTTPException(status_code=404, detail="target device not registered")
@@ -489,10 +502,254 @@ async def api_devices_transfer(target_id: str, request: Request):
 @app.get("/api/devices/{device_id}/commands")
 async def api_devices_commands(device_id: str, request: Request):
     """Drain pending commands for `device_id` — called by clients on their
-    3-second poll cycle. Each command is `{type: 'play' | 'pause', ...}`."""
+    3-second poll cycle. Each command is `{type: 'play' | 'pause' | 'transferTo', ...}`."""
     user = _user_from(request)
     cmds = devices_registry.poll_commands(user, device_id)
     return JSONResponse(cmds, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/devices/{holder_id}/request-transfer")
+async def api_devices_request_transfer(holder_id: str, request: Request):
+    """The caller (target_id) asks `holder_id` to transfer playback to them.
+    Body: {target_id}. The holder handles it on its next poll and issues a
+    normal transfer including the full up-next queue."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    target_id = (body.get("target_id") or "").strip()
+    if not target_id:
+        raise HTTPException(status_code=400, detail="target_id required")
+    user = _user_from(request)
+    ok = devices_registry.request_transfer(user, holder_id, target_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="holder device not registered")
+    return {"ok": True}
+
+
+# ─── Guest Request (QR-code remote control) ───────────────────────────
+# Host mints a token → passenger scans a QR → passenger's browser lands on
+# /guest/<token>, a public page that lets them search and tap a track. The tap
+# ships a `replaceNowPlaying` command to the host device, swapping the current
+# song without wiping the host's up-next.
+
+
+def _guest_admin_auth() -> list[tuple[str, str]]:
+    """Subsonic query params used when searching Navidrome on a guest's behalf.
+    Requires NAVIDROME_USER / NAVIDROME_PASS in the environment."""
+    if not NAVIDROME_GUEST_USER or not NAVIDROME_GUEST_PASS:
+        raise HTTPException(
+            status_code=503,
+            detail="guest search unavailable: NAVIDROME_USER/NAVIDROME_PASS not configured",
+        )
+    return [
+        ("u", NAVIDROME_GUEST_USER),
+        ("p", NAVIDROME_GUEST_PASS),
+        ("v", "1.16.1"),
+        ("c", "geethub-guest"),
+        ("f", "json"),
+    ]
+
+
+@app.post("/api/guest/session")
+async def api_guest_session_create(request: Request):
+    """Host mints a guest-session token. Body: {deviceId}. `u` (Subsonic user)
+    from query params identifies the account. Returns {token, expiresAt}.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    user = _user_from(request)
+    host_device_id = (body.get("deviceId") or "").strip()
+    if not host_device_id:
+        raise HTTPException(status_code=400, detail="deviceId required")
+    session = guest_sessions.create(user, host_device_id)
+    return JSONResponse(
+        {"token": session["token"], "expiresAt": session["expires_at"]},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/guest/session/{token}")
+async def api_guest_session_get(token: str):
+    """Public: guest checks that its token is still valid. Returns
+    {ok, expiresAt} or 404 if the session was revoked/expired."""
+    s = guest_sessions.get(token)
+    if not s:
+        raise HTTPException(status_code=404, detail="unknown or expired token")
+    return JSONResponse(
+        {"ok": True, "expiresAt": s["expires_at"]},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.delete("/api/guest/session/{token}")
+async def api_guest_session_revoke(token: str, request: Request):
+    """Host revokes an active guest session. `u` must match the token's owner."""
+    user = _user_from(request)
+    s = guest_sessions.get(token)
+    if not s or s["user"] != user:
+        raise HTTPException(status_code=404, detail="unknown token")
+    guest_sessions.revoke(token)
+    return {"ok": True}
+
+
+@app.get("/api/guest/search")
+async def api_guest_search(request: Request):
+    """Public: guest search. Query: token, q, optional songCount / ytSource.
+    Uses server-configured admin creds to talk to Navidrome — no host
+    credentials cross the guest boundary. YouTube injection matches the
+    normal search3 path so the guest sees the same result mix the host sees.
+    """
+    token = (request.query_params.get("token") or "").strip()
+    s = guest_sessions.get(token)
+    if not s:
+        raise HTTPException(status_code=404, detail="unknown or expired token")
+    query = (request.query_params.get("q") or "").strip()
+    if not query:
+        # Empty query: return an empty song list rather than 400 — matches
+        # what Navidrome does and lets the SPA reuse the same fetch logic.
+        return JSONResponse({"subsonic-response": {"status": "ok", "version": "1.16.1",
+                                                    "searchResult3": {}}},
+                            headers={"Cache-Control": "no-store"})
+    try:
+        song_count = int(request.query_params.get("songCount", "40"))
+    except ValueError:
+        song_count = 40
+    source = (request.query_params.get("ytSource", "") or "ytmusic").lower()
+
+    params = _guest_admin_auth() + [
+        ("query", query), ("songCount", str(song_count)),
+        ("artistCount", "0"), ("albumCount", "0"),
+    ]
+    r = await client.get(f"{NAVIDROME_URL}/rest/search3.view", params=params)
+    body = r.content
+    if r.status_code == 200 and song_count > 0:
+        engine = youtube_music if source == "ytmusic" else youtube
+        virtuals = await engine.search(query, YT_SEARCH_LIMIT)
+        if virtuals:
+            body = subsonic.inject_search3(body, True, virtuals)
+    headers = {k: v for k, v in _clean_headers(r.headers).items()
+               if k.lower() not in ("content-encoding", "content-length")}
+    headers["Cache-Control"] = "no-store"
+    return Response(content=body, status_code=r.status_code,
+                    headers=headers, media_type=r.headers.get("content-type"))
+
+
+@app.get("/api/guest/cover")
+async def api_guest_cover(request: Request):
+    """Public: cover art for a search-result row. Query: token, id, optional size.
+    Virtual yt-*/ytm-* ids redirect to the YouTube thumbnail (same as the host
+    path); real ids are fetched from Navidrome with admin creds."""
+    token = (request.query_params.get("token") or "").strip()
+    s = guest_sessions.get(token)
+    if not s:
+        raise HTTPException(status_code=404, detail="unknown or expired token")
+    track_id = (request.query_params.get("id") or "").strip()
+    if not track_id:
+        raise HTTPException(status_code=400, detail="id required")
+    if youtube.is_virtual(track_id):
+        return handle_coverart(track_id)
+    size = request.query_params.get("size", "300")
+    params = _guest_admin_auth() + [("id", track_id), ("size", str(size))]
+    r = await client.get(f"{NAVIDROME_URL}/rest/getCoverArt.view", params=params)
+    headers = {k: v for k, v in _clean_headers(r.headers).items()
+               if k.lower() not in ("content-encoding", "content-length")}
+    return Response(content=r.content, status_code=r.status_code,
+                    headers=headers, media_type=r.headers.get("content-type"))
+
+
+@app.post("/api/guest/play")
+async def api_guest_play(request: Request):
+    """Public: guest taps a track. Body: {token, song}. Queues a
+    ``replaceNowPlaying`` command on the host device."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    token = (body.get("token") or "").strip()
+    s = guest_sessions.get(token)
+    if not s:
+        raise HTTPException(status_code=404, detail="unknown or expired token")
+    song = body.get("song")
+    if not isinstance(song, dict) or not song.get("id"):
+        raise HTTPException(status_code=400, detail="song with id required")
+    ok = devices_registry.replace_now_playing(s["user"], s["host_device_id"], song)
+    if not ok:
+        raise HTTPException(status_code=404, detail="host device offline")
+    return {"ok": True}
+
+
+async def handle_similar_songs2(request: Request, path: str) -> Response:
+    """Intercept getSimilarSongs2 and return a cross-artist ListenBrainz radio
+    when the seed track has an MBID and enough recommendations resolve locally.
+    Otherwise falls through to Navidrome's own artist-based similar-songs so we
+    never return an empty response."""
+    seed_id = (request.query_params.get("id") or "").strip()
+    try:
+        count = int(request.query_params.get("count", "50"))
+    except ValueError:
+        count = 50
+    if not seed_id or count <= 0:
+        return await passthrough(request, path)
+
+    is_json = request.query_params.get("f", "xml").lower() in ("json", "jsonp")
+    songs, dbg = await radio.build_radio(client, NAVIDROME_URL,
+                                         request.query_params, seed_id, count)
+    if not songs:
+        log.info("radio: falling back for seed=%s (%s)", seed_id, dbg.get("skipped"))
+        return await passthrough(request, path)
+
+    log.info("radio: seed=%s mbid=%s lb=%d resolved=%d",
+             seed_id, dbg["seed_mbid"], dbg["lb_returned"], dbg["resolved"])
+
+    if is_json:
+        doc = {"subsonic-response": {"status": "ok", "version": "1.16.1",
+                                     "type": "navidrome",
+                                     "similarSongs2": {"song": songs}}}
+        return Response(content=json.dumps(doc).encode(),
+                        media_type="application/json")
+    # XML shape — build ``<song ... />`` children with just the attrs Navidrome
+    # emits (id/title/artist/album/duration/… — we pass through whatever came
+    # back from search3, which already matches Subsonic's Child schema).
+    def _xml_song(s: dict) -> str:
+        attrs = " ".join(
+            f'{k}="{subsonic._xml_escape(v)}"'
+            for k, v in s.items()
+            if isinstance(v, (str, int, float, bool))
+        )
+        return f"<song {attrs}/>"
+    body = ('<?xml version="1.0" encoding="UTF-8"?>'
+            '<subsonic-response xmlns="http://subsonic.org/restapi" '
+            'status="ok" version="1.16.1">'
+            '<similarSongs2>' + "".join(_xml_song(s) for s in songs) +
+            '</similarSongs2></subsonic-response>')
+    return Response(content=body.encode(), media_type="application/xml")
+
+
+@app.get("/api/radio/debug")
+async def api_radio_debug(request: Request):
+    """Diagnostic: run the radio pipeline for a seed and return everything —
+    seed metadata, whether an MBID was present, raw ListenBrainz count, and
+    how many recommendations resolved to local tracks. Useful for verifying
+    MBID coverage before trusting the interceptor. Requires the same Subsonic
+    auth query params (u, t, s, c, v) any other rest/ call would carry."""
+    seed_id = (request.query_params.get("id") or "").strip()
+    if not seed_id:
+        raise HTTPException(status_code=400, detail="id required")
+    try:
+        count = int(request.query_params.get("count", "20"))
+    except ValueError:
+        count = 20
+    songs, dbg = await radio.build_radio(client, NAVIDROME_URL,
+                                         request.query_params, seed_id, count)
+    return JSONResponse(
+        {"debug": dbg, "returned": len(songs),
+         "sample": [{"id": s.get("id"), "artist": s.get("artist"),
+                     "title": s.get("title")} for s in songs[:10]]},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def _serve_web(path: str) -> Response:
@@ -526,6 +783,10 @@ async def catch_all(request: Request, path: str):
     if endpoint == "search3":
         return await handle_search3(request, path)
 
+    # Radio: rewrite similar-songs into a ListenBrainz cross-artist queue.
+    if endpoint == "getSimilarSongs2":
+        return await handle_similar_songs2(request, path)
+
     # Phase 4: adding a yt- track to the magic playlist triggers an Antra download.
     if endpoint in ("updatePlaylist", "createPlaylist"):
         return await handle_playlist_edit(request, path, endpoint)
@@ -547,3 +808,4 @@ async def catch_all(request: Request, path: str):
 @app.on_event("shutdown")
 async def _shutdown():
     await client.aclose()
+    await listenbrainz.aclose()

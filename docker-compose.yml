@@ -26,3 +26,13 @@ services:
       FALLBACK_DIR: /music/YouTube
       # Phase 4 only (kept in .env on the server, chmod 600 — never committed):
       ANTRA_ADMIN_KEY: ${ANTRA_ADMIN_KEY:-}
+      # Guest Request: read-only Navidrome creds the proxy uses to search
+      # on behalf of an anonymous scanned-in guest. Also in .env, chmod 600.
+      NAVIDROME_USER: ${NAVIDROME_USER:-}
+      NAVIDROME_PASS: ${NAVIDROME_PASS:-}
+      # Radio mode: cross-artist queue built from ListenBrainz similar-recordings.
+      # Kill-switch — set RADIO_ENABLED=false to instantly revert to Navidrome's
+      # artist-based getSimilarSongs2 without a rebuild.
+      RADIO_ENABLED: ${RADIO_ENABLED:-true}
+      LISTENBRAINZ_URL: https://labs.api.listenbrainz.org
+      RADIO_MIN_RESULTS: 10

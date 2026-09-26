@@ -7,6 +7,8 @@
 import { writable, get, type Readable } from 'svelte/store'
 import { session } from './session'
 import type { Song, DownloadStatus, Device, DeviceSong } from '../subsonic/models'
+import { youtubeVideoId } from '../subsonic/models'
+import { ytVideo } from '../player/youtubeVideo'
 
 export type RepeatMode = 'off' | 'all' | 'one'
 
@@ -19,6 +21,9 @@ interface PlayerState {
   isPlaying: boolean
   currentTime: number
   duration: number
+  // "Watch video": for a virtual (yt-/ytm-) track, the embedded YouTube player
+  // takes over from the audio element until toggled off.
+  videoMode: boolean
   // Local favorite overrides (optimistic) — song.id → true|false.
   favoriteOverride: Record<string, boolean>
   // Recently played (persisted to localStorage, capped at 10).
@@ -32,12 +37,27 @@ interface PlayerState {
   // Multi-device
   deviceId: string
   devices: Device[]
+  // Radio: when on, natural queue-end triggers a fetch of similar tracks
+  // seeded from the currently-playing song so playback never dries up.
+  radioMode: boolean
 }
 
 const RECENTS_KEY = 'geethub.recentlyPlayed'
 const RECENTS_MAX = 10
 const DEVICE_ID_KEY = 'geethub.deviceId'
 const VOLUME_KEY = 'geethub.volume'
+const RADIO_KEY = 'geethub.radioMode'
+// Fetch more similar songs when fewer than this many remain after the current.
+const RADIO_LOOKAHEAD = 2
+// How many similar songs to ask for each top-up.
+const RADIO_BATCH = 20
+
+function loadRadio(): boolean {
+  try { return localStorage.getItem(RADIO_KEY) === '1' } catch (_) { return false }
+}
+function saveRadio(on: boolean) {
+  try { localStorage.setItem(RADIO_KEY, on ? '1' : '0') } catch (_) {}
+}
 
 function loadVolume(): number {
   try {
@@ -94,11 +114,12 @@ function saveRecents(list: Song[]) {
 
 const initial: PlayerState = {
   queue: [], index: 0, shuffleOrder: null, isShuffled: false, repeatMode: 'off',
-  isPlaying: false, currentTime: 0, duration: 0,
+  isPlaying: false, currentTime: 0, duration: 0, videoMode: false,
   favoriteOverride: {}, recentlyPlayed: loadRecents(),
   savedYouTube: new Set(), downloads: {}, failedDownloads: new Set(),
   volume: loadVolume(),
   deviceId: loadDeviceId(), devices: [],
+  radioMode: loadRadio(),
 }
 
 const store = writable<PlayerState>(initial)
@@ -139,9 +160,24 @@ function startCurrent(next: PlayerState) {
   const client = get(session).client
   if (!client) return
   const a = ensureAudio()
+  // Always prime the audio element so exiting video mode resumes the right song.
   a.src = client.streamURL(song.id)
   a.currentTime = 0
-  a.play().catch(() => { /* interrupted — user will retry */ })
+  if (next.videoMode) {
+    const vid = youtubeVideoId(song.id)
+    if (vid) {
+      a.pause()                       // iframe stays the active engine
+      ytVideo.load(vid, 0, true)
+    } else {
+      // Next track isn't a video source — drop back to audio.
+      ytVideo.destroy()
+      videoMounted = false
+      next.videoMode = false
+      a.play().catch(() => {})
+    }
+  } else {
+    a.play().catch(() => { /* interrupted — user will retry */ })
+  }
   recordPlayed(song)
   updateMediaSession(song)
 }
@@ -197,6 +233,16 @@ async function refreshDevices() {
   store.update((s) => ({ ...s, devices: list }))
 }
 
+function fromDeviceSong(d: DeviceSong): Song {
+  return {
+    id: d.id, title: d.title,
+    artist: d.artist ?? undefined,
+    album: d.album ?? undefined,
+    coverArt: d.coverArt ?? undefined,
+    duration: d.duration ?? undefined,
+  }
+}
+
 async function drainDeviceCommands() {
   const client = get(session).client
   if (!client) return
@@ -205,16 +251,25 @@ async function drainDeviceCommands() {
   for (const cmd of cmds) {
     if (cmd.type === 'pause') {
       if (audio && !audio.paused) audio.pause()
+    } else if (cmd.type === 'replaceNowPlaying' && cmd.song) {
+      // Guest Request tapped a track — swap our current now-playing for it,
+      // leaving the rest of the queue intact.
+      replaceNowPlaying(fromDeviceSong(cmd.song))
+    } else if (cmd.type === 'transferTo' && cmd.target_id) {
+      // Some other device is asking us to hand playback over — do a normal
+      // transfer, which ships the full queue.
+      transferToDevice(cmd.target_id)
     } else if (cmd.type === 'play' && cmd.song) {
-      // Reconstruct a Song-shaped object so the existing play() path works.
-      const reconstructed: Song = {
-        id: cmd.song.id, title: cmd.song.title,
-        artist: cmd.song.artist ?? undefined,
-        album: cmd.song.album ?? undefined,
-        coverArt: cmd.song.coverArt ?? undefined,
-        duration: cmd.song.duration ?? undefined,
-      }
-      play([reconstructed], 0)
+      // Newer clients ship the full up-next list so the target sees the same
+      // queue the source was playing. Older clients omit it — fall back to
+      // a single-song queue built from `song`.
+      const songs: Song[] = (cmd.queue && cmd.queue.length > 0)
+        ? cmd.queue.map(fromDeviceSong)
+        : [fromDeviceSong(cmd.song)]
+      const startAt = (cmd.queue && cmd.queue.length > 0)
+        ? Math.min(Math.max(cmd.index ?? 0, 0), songs.length - 1)
+        : 0
+      play(songs, startAt)
       const pos = cmd.position ?? 0
       if (pos > 0) {
         // Wait briefly for metadata to load before seeking.
@@ -222,6 +277,15 @@ async function drainDeviceCommands() {
       }
     }
   }
+}
+
+/// Ask the currently-playing device (holder) to transfer playback to us. The
+/// holder handles the request on its next poll — ~3s round-trip on average.
+async function grabFromDevice(holderId: string) {
+  const client = get(session).client
+  if (!client) return
+  const s = get(store)
+  await client.requestTransfer(holderId, s.deviceId).catch(() => {})
 }
 
 async function transferToDevice(targetId: string) {
@@ -232,8 +296,15 @@ async function transferToDevice(targetId: string) {
   if (!cur) return
   // Pause locally immediately.
   audio?.pause()
-  await client.transferPlayback(targetId, s.deviceId, toDeviceSong(cur), s.currentTime)
-    .catch(() => {})
+  // Ship the FULL queue + index so the target restores the same up-next
+  // list rather than a one-song stub. Fall back gracefully on the server
+  // side if the target is an older client.
+  const queue = s.queue.map(toDeviceSong)
+  await client.transferPlayback(
+    targetId, s.deviceId,
+    toDeviceSong(cur), s.currentTime,
+    queue, s.index,
+  ).catch(() => {})
   // Refresh device list soon so the target's isPlaying flips.
   setTimeout(() => { refreshDevices() }, 2000)
 }
@@ -269,6 +340,27 @@ function play(songs: Song[], startAt = 0) {
   })
 }
 
+/** Swap the currently-playing slot for `song`, preserving the tail of the queue.
+ *  If nothing is queued, seed the queue with just this song. */
+function replaceNowPlaying(song: Song) {
+  store.update((s) => {
+    if (s.queue.length === 0) {
+      const next: PlayerState = {
+        ...s, queue: [song], index: 0,
+        shuffleOrder: null, isShuffled: false,
+      }
+      startCurrent(next)
+      return next
+    }
+    const realIdx = s.isShuffled && s.shuffleOrder ? s.shuffleOrder[s.index] : s.index
+    const newQueue = [...s.queue]
+    newQueue[realIdx] = song
+    const next: PlayerState = { ...s, queue: newQueue }
+    startCurrent(next)
+    return next
+  })
+}
+
 function playShuffled(songs: Song[]) {
   if (songs.length === 0) return
   const order = [...songs.keys()].sort(() => Math.random() - 0.5)
@@ -280,18 +372,78 @@ function playShuffled(songs: Song[]) {
 }
 
 function pause() {
+  if (get(store).videoMode) { ytVideo.pause(); return }
   audio?.pause()
 }
 function resume() {
+  if (get(store).videoMode) { ytVideo.play(); return }
   audio?.play().catch(() => {})
 }
 function toggle() {
+  if (get(store).videoMode) {
+    if (ytVideo.isPlaying()) ytVideo.pause(); else ytVideo.play()
+    return
+  }
   if (!audio) return
   if (audio.paused) resume(); else pause()
 }
 function seek(t: number) {
+  if (get(store).videoMode) {
+    ytVideo.seek(t)
+    store.update((s) => ({ ...s, currentTime: t }))
+    return
+  }
   if (audio) audio.currentTime = t
   store.update((s) => ({ ...s, currentTime: t }))
+}
+
+// ─── Watch video (embedded YouTube) ─────────────────────────────
+// The container div lives in PlayerDock; it registers via mountVideo() once
+// videoMode flips on (so the element is laid out before the player attaches).
+let videoMounted = false
+
+/** Toggle "Watch video" for the current virtual track. */
+function toggleVideo() {
+  get(store).videoMode ? endVideo() : beginVideo()
+}
+
+function beginVideo() {
+  const s = get(store)
+  const song = currentSong(s)
+  if (!song || !youtubeVideoId(song.id)) return
+  pause()                              // stop the audio element first
+  store.update((st) => ({ ...st, videoMode: true }))
+}
+
+/** Called by PlayerDock's effect once the video container is on-screen. */
+function mountVideo(container: HTMLElement) {
+  if (videoMounted) return
+  const s = get(store)
+  const song = currentSong(s)
+  const vid = song ? youtubeVideoId(song.id) : null
+  if (!vid) return
+  videoMounted = true
+  ytVideo.mount(container, vid, s.currentTime, true, {
+    onEnded: () => next(),
+    onState: (playing) => store.update((st) => ({ ...st, isPlaying: playing })),
+    onTime: (cur, dur) => store.update((st) => ({
+      ...st, currentTime: cur, duration: isFinite(dur) && dur > 0 ? dur : st.duration,
+    })),
+    onError: () => endVideo(),
+  })
+}
+
+function endVideo() {
+  if (!get(store).videoMode) return
+  const t = ytVideo.currentTime()
+  const wasPlaying = ytVideo.isPlaying()
+  ytVideo.destroy()
+  videoMounted = false
+  store.update((st) => ({ ...st, videoMode: false, currentTime: t }))
+  if (audio) {
+    audio.currentTime = t
+    if (wasPlaying) audio.play().catch(() => {})
+  }
 }
 
 function setVolume(v: number) {
@@ -308,17 +460,75 @@ function next() {
     if (s.repeatMode === 'one') { startCurrent(s); return s }
     if (i >= s.queue.length) {
       if (s.repeatMode === 'all') i = 0
+      else if (s.radioMode) {
+        // Nothing scheduled after this — extend the queue with similar tracks
+        // seeded from what's currently playing, then advance into them.
+        void topUpRadio()
+        pause()
+        return s
+      }
       else { pause(); return s }
     }
     const nx: PlayerState = { ...s, index: i }
     startCurrent(nx)
+    // Pre-fetch when the tail gets thin so playback stays seamless.
+    if (nx.radioMode && nx.queue.length - nx.index - 1 <= RADIO_LOOKAHEAD) {
+      void topUpRadio()
+    }
     return nx
   })
 }
 
+// Radio: fetch songs similar to whatever's playing right now and append them
+// to the queue. Deduped against ids we already have. Best-effort — swallows
+// errors so a bad request never disrupts playback.
+let radioTopUpInFlight = false
+async function topUpRadio() {
+  if (radioTopUpInFlight) return
+  const s = get(store)
+  const seed = currentSong(s)
+  const client = get(session).client
+  if (!seed || !client) return
+  radioTopUpInFlight = true
+  try {
+    const similar = await client.similarSongs(seed.id, RADIO_BATCH)
+    if (!similar || similar.length === 0) return
+    store.update((st) => {
+      const have = new Set(st.queue.map((x) => x.id))
+      const fresh = similar.filter((x) => x && x.id && !have.has(x.id))
+      if (fresh.length === 0) return st
+      const queue = [...st.queue, ...fresh]
+      // If playback stopped because we ran out of tracks, resume into the
+      // first freshly-added one.
+      if (!st.isPlaying && st.index >= st.queue.length - 1) {
+        const nx: PlayerState = { ...st, queue, index: st.queue.length }
+        startCurrent(nx)
+        return nx
+      }
+      return { ...st, queue }
+    })
+  } catch (_) { /* transient — try again on the next transition */ }
+  finally { radioTopUpInFlight = false }
+}
+
+function toggleRadio() {
+  store.update((s) => {
+    const on = !s.radioMode
+    saveRadio(on)
+    return { ...s, radioMode: on }
+  })
+  // Flipping on with a nearly-empty tail should feel instant — top up now.
+  const s = get(store)
+  if (s.radioMode && s.queue.length - s.index - 1 <= RADIO_LOOKAHEAD) {
+    void topUpRadio()
+  }
+}
+
 function previous() {
   // Emulate the app's behaviour: within 3s → jump to prev song; else restart.
-  if (audio && audio.currentTime > 3) { audio.currentTime = 0; return }
+  if (get(store).videoMode) {
+    if (ytVideo.currentTime() > 3) { ytVideo.seek(0); return }
+  } else if (audio && audio.currentTime > 3) { audio.currentTime = 0; return }
   store.update((s) => {
     if (s.queue.length === 0) return s
     const i = s.index === 0
@@ -437,14 +647,21 @@ function markSaved(id: string) {
 
 export const player = {
   subscribe: store.subscribe,
-  play, playShuffled,
+  play, playShuffled, replaceNowPlaying,
   toggle, pause, resume, seek, next, previous, jumpTo,
   setVolume,
-  toggleShuffle, cycleRepeat,
+  toggleVideo, mountVideo, endVideo,
+  toggleShuffle, cycleRepeat, toggleRadio,
   toggleFavorite, isFavorite,
   saveCurrentToLibrary, saveTrack, markSaved,
   // Multi-device
-  refreshDevices, transferToDevice,
+  refreshDevices, transferToDevice, grabFromDevice,
+}
+
+/// The first other device currently reporting isPlaying — used by the mini
+/// player to surface "playing on iPad" when local is idle.
+export function remotePlayingDeviceOf(state: PlayerState): Device | undefined {
+  return state.devices.find((d) => d.id !== state.deviceId && d.isPlaying && d.currentSong)
 }
 
 /** Convenience selector for the currently-playing song (or undefined). */

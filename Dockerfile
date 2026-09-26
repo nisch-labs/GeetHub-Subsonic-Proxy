@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # --pre yt-dlp[default]`) if extraction ever starts failing.
 RUN pip install --no-cache-dir -U --pre "yt-dlp[default]"
 
-COPY app.py youtube.py youtube_music.py subsonic.py antra.py deezer.py devices.py .
+COPY app.py youtube.py youtube_music.py subsonic.py antra.py deezer.py devices.py guest.py .
 
 # Bring in the built web app; app.py serves it as static files at /.
 COPY --from=web /web/dist /app/web

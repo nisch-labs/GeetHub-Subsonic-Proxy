@@ -4,7 +4,7 @@
  * The salt is a fresh random string per-request so the token can't be replayed. */
 
 export interface Credentials {
-  baseURL: string       // e.g. "https://music.example.com"
+  baseURL: string       // e.g. "https://musicv2.nixsocket.com"
   username: string
   password: string
   clientName: string    // e.g. "GeetHub Web"

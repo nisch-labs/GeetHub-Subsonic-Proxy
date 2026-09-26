@@ -1,8 +1,10 @@
 <script lang="ts">
   import { player, currentSongOf } from '../stores/player'
   import { session } from '../stores/session'
-  import { virtualSource, shortLabel, type LyricLine } from '../subsonic/models'
+  import { nowPlayingOpen } from '../stores/nowPlaying'
+  import { virtualSource, shortLabel, type LyricLine, type Song } from '../subsonic/models'
   import Artwork from './Artwork.svelte'
+  import GuestQRModal from './GuestQRModal.svelte'
 
   const current = $derived(currentSongOf($player))
   // Chunked streams (YouTube transcodes) report duration = Infinity — the
@@ -21,23 +23,25 @@
     return $session.client.coverArtURL(current.coverArt, 512)
   })
 
-  const upNext = $derived.by(() => {
+  // Full play-ordered queue with the current position marked. We render the
+  // whole thing (not just what's ahead) so tapping a track before the current
+  // one jumps back to it instead of making it look like the queue vanished.
+  // `jumpIndex` is the value to pass to player.jumpTo — a position in the play
+  // sequence (i.e. an index into shuffleOrder when shuffled, else into queue).
+  type QueueRow = { song: Song; jumpIndex: number; isCurrent: boolean }
+  const orderedQueue = $derived.by<QueueRow[]>(() => {
     if (!$player.queue.length) return []
     if ($player.isShuffled && $player.shuffleOrder) {
-      // Songs remaining in the shuffled order.
-      return $player.shuffleOrder.slice($player.index + 1).map((i) => $player.queue[i])
+      return $player.shuffleOrder.map((real, orderPos) => ({
+        song: $player.queue[real],
+        jumpIndex: orderPos,
+        isCurrent: orderPos === $player.index,
+      }))
     }
-    return $player.queue.slice($player.index + 1)
+    return $player.queue.map((song, real) => ({
+      song, jumpIndex: real, isCurrent: real === $player.index,
+    }))
   })
-
-  function jumpFromUpNext(relIndex: number) {
-    if ($player.isShuffled && $player.shuffleOrder) {
-      const real = $player.shuffleOrder[$player.index + 1 + relIndex]
-      if (real != null) player.jumpTo(real)
-    } else {
-      player.jumpTo($player.index + 1 + relIndex)
-    }
-  }
 
   function fmt(t: number): string {
     if (!isFinite(t) || t < 0) return '--:--'
@@ -58,6 +62,8 @@
 
   // Devices popover state
   let devicesOpen = $state(false)
+  // Guest Request modal
+  let guestQROpen = $state(false)
 
   function openDevices() {
     devicesOpen = !devicesOpen
@@ -99,13 +105,43 @@
   // Progress arc geometry.
   const RING = 240, R = 110
   const C = 2 * Math.PI * R
+
+  // ─── Watch video (embedded YouTube) ───────────────────────────
+  const isVirtual = $derived(!!current && !!virtualSource(current.id))
+  let videoEl = $state<HTMLDivElement | null>(null)
+  let cinema = $state(false)
+
+  // Attach the YouTube player once the container is on-screen. The store guards
+  // against re-mounting, so this can fire on every store tick harmlessly.
+  $effect(() => {
+    if ($player.videoMode && videoEl) player.mountVideo(videoEl)
+  })
+  // Leaving video mode resets the cinema (widened) layout.
+  $effect(() => { if (!$player.videoMode) cinema = false })
+
+  function toggleFullscreen() {
+    const el = videoEl
+    if (!el) return
+    if (document.fullscreenElement) document.exitFullscreen?.()
+    else el.requestFullscreen?.()
+  }
 </script>
 
 {#if current}
-  <aside class="dock" aria-label="Now playing">
+  <aside class="dock" class:open={$nowPlayingOpen} aria-label="Now playing">
     <header>
+      <button class="close-btn" onclick={() => nowPlayingOpen.set(false)} aria-label="Close now playing">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+      </button>
       <span class="retro retro-sm retro-graphite">Now Playing</span>
       <div class="spacer"></div>
+      <button class="hdr-btn" onclick={() => guestQROpen = true} aria-label="Guest Request">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+          <rect x="3" y="14" width="7" height="7" rx="1"/>
+          <path d="M14 14h3v3h-3zM20 14h1M14 20h3M20 17v4"/>
+        </svg>
+      </button>
       <div class="devices-wrap">
         <button class="hdr-btn" onclick={openDevices} aria-label="Devices">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
@@ -166,22 +202,48 @@
       {/if}
     </header>
 
-    <div class="record" style:--ring="{RING}px">
-      <svg class="ring" viewBox="0 0 {RING} {RING}" aria-hidden="true">
-        <circle cx={RING/2} cy={RING/2} r={R} fill="none" stroke="var(--hairline)" stroke-width="4" />
-        <circle cx={RING/2} cy={RING/2} r={R} fill="none" stroke="var(--accent)" stroke-width="4"
-                stroke-linecap="round"
-                stroke-dasharray={C}
-                stroke-dashoffset={C * (1 - Math.min(Math.max(progress, 0), 1))}
-                transform="rotate(-90 {RING/2} {RING/2})" />
-      </svg>
-      <div class="vinyl" class:spin={$player.isPlaying}>
-        <div class="black-rim"></div>
-        {#if artURL}<img class="art" src={artURL} alt="" />{:else}<div class="art no-art"></div>{/if}
-        <div class="label-ring"></div>
-        <div class="spindle"></div>
+    {#if $player.videoMode}
+      <div class="video-stage" class:cinema>
+        <div class="video-frame" bind:this={videoEl}></div>
+        <div class="video-controls">
+          <button class="vc-btn" onclick={player.toggleVideo} aria-label="Back to audio">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/></svg>
+            <span class="retro retro-sm retro-medium">Audio</span>
+          </button>
+          <button class="vc-btn" class:on={cinema} onclick={() => cinema = !cinema} aria-label="Cinema view">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/></svg>
+            <span class="retro retro-sm retro-medium">{cinema ? 'Standard' : 'Cinema'}</span>
+          </button>
+          <button class="vc-btn" onclick={toggleFullscreen} aria-label="Fullscreen">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3m8 0h3a2 2 0 0 0 2-2v-3"/></svg>
+            <span class="retro retro-sm retro-medium">Full</span>
+          </button>
+        </div>
       </div>
-    </div>
+    {:else}
+      <div class="record" style:--ring="{RING}px">
+        <svg class="ring" viewBox="0 0 {RING} {RING}" aria-hidden="true">
+          <circle cx={RING/2} cy={RING/2} r={R} fill="none" stroke="var(--hairline)" stroke-width="4" />
+          <circle cx={RING/2} cy={RING/2} r={R} fill="none" stroke="var(--accent)" stroke-width="4"
+                  stroke-linecap="round"
+                  stroke-dasharray={C}
+                  stroke-dashoffset={C * (1 - Math.min(Math.max(progress, 0), 1))}
+                  transform="rotate(-90 {RING/2} {RING/2})" />
+        </svg>
+        <div class="vinyl" class:spin={$player.isPlaying}>
+          <div class="black-rim"></div>
+          {#if artURL}<img class="art" src={artURL} alt="" />{:else}<div class="art no-art"></div>{/if}
+          <div class="label-ring"></div>
+          <div class="spindle"></div>
+        </div>
+      </div>
+      {#if isVirtual}
+        <button class="watch-btn" onclick={player.toggleVideo}>
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+          <span class="retro retro-sm retro-medium">Watch video</span>
+        </button>
+      {/if}
+    {/if}
 
     <div class="info">
       {#if virtualSource(current.id) && !$player.savedYouTube.has(current.id)}
@@ -253,6 +315,14 @@
           {/if}
         </svg>
       </button>
+      <button class="icon-btn" class:on={$player.radioMode} onclick={player.toggleRadio}
+              aria-label="Radio" title={$player.radioMode ? 'Radio on — auto-queues similar songs' : 'Radio off'}>
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 11a8 8 0 0 1 16 0" />
+          <path d="M7.5 13.5a4.5 4.5 0 0 1 9 0" />
+          <circle cx="12" cy="16" r="1.5" />
+        </svg>
+      </button>
     </div>
 
     <div class="tabs" role="tablist">
@@ -266,19 +336,23 @@
 
     <div class="panel" role="tabpanel">
       {#if tab === 'upNext'}
-        {#if upNext.length === 0}
-          <div class="empty retro retro-sm retro-light retro-graphite">No more songs queued.</div>
+        {#if orderedQueue.length === 0}
+          <div class="empty retro retro-sm retro-light retro-graphite">No songs queued.</div>
         {:else}
           <ol class="queue">
-            {#each upNext as s, i}
+            {#each orderedQueue as row (row.jumpIndex)}
               <li>
-                <button class="q-row" onclick={() => jumpFromUpNext(i)}>
-                  <Artwork coverArt={s.coverArt} size={36} corner={5} />
+                <button
+                  class="q-row"
+                  class:current={row.isCurrent}
+                  onclick={() => player.jumpTo(row.jumpIndex)}
+                >
+                  <Artwork coverArt={row.song.coverArt} size={36} corner={5} />
                   <div class="q-text">
-                    <div class="retro q-title">{s.title}</div>
-                    <div class="retro retro-light retro-graphite q-sub">{s.artist ?? ''}</div>
+                    <div class="retro q-title">{row.song.title}</div>
+                    <div class="retro retro-light retro-graphite q-sub">{row.song.artist ?? ''}</div>
                   </div>
-                  <span class="mono q-dur">{fmt(s.duration ?? 0)}</span>
+                  <span class="mono q-dur">{fmt(row.song.duration ?? 0)}</span>
                 </button>
               </li>
             {/each}
@@ -301,6 +375,10 @@
   </aside>
 {/if}
 
+{#if guestQROpen}
+  <GuestQRModal onClose={() => guestQROpen = false} />
+{/if}
+
 <style>
   .dock {
     width: 400px;
@@ -317,6 +395,14 @@
     padding: 14px 20px 4px;
   }
   .spacer { flex: 1; }
+  /* Only shown when the dock is a full-screen sheet (mobile). */
+  .close-btn {
+    display: none;
+    width: 36px; height: 36px;
+    align-items: center; justify-content: center;
+    border-radius: 50%; color: var(--ink);
+    margin-right: 2px;
+  }
   .hdr-btn {
     width: 36px; height: 36px;
     display: flex; align-items: center; justify-content: center;
@@ -386,6 +472,38 @@
     border: 1px solid var(--hairline);
     box-shadow: inset 0 0 0 6px var(--surface), inset 0 0 0 7px color-mix(in oklab, var(--ink) 80%, transparent);
   }
+
+  /* Watch video */
+  .watch-btn {
+    display: flex; align-items: center; gap: 7px;
+    margin: 2px auto 6px;
+    padding: 7px 14px;
+    color: white; background: rgb(230, 33, 33);
+    border-radius: 999px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.18);
+  }
+  .watch-btn:hover { filter: brightness(1.06); }
+
+  .video-stage { padding: 8px 20px 6px; }
+  .video-stage.cinema { padding: 8px 0 6px; }
+  .video-frame {
+    width: 100%; aspect-ratio: 16 / 9;
+    background: #000;
+    border-radius: 14px; overflow: hidden;
+  }
+  .video-stage.cinema .video-frame { border-radius: 0; }
+  .video-frame :global(iframe) { display: block; width: 100%; height: 100%; border: 0; }
+  .video-controls {
+    display: flex; justify-content: center; gap: 10px;
+    padding: 10px 4px 2px;
+  }
+  .vc-btn {
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 12px;
+    color: var(--graphite); border-radius: 999px;
+  }
+  .vc-btn:hover { background: color-mix(in oklab, var(--hairline) 50%, transparent); color: var(--ink); }
+  .vc-btn.on { color: var(--accent); }
 
   .info { padding: 4px 24px 8px; }
   .info .title { font-size: 18px; }
@@ -530,6 +648,8 @@
     transition: background 0.12s;
   }
   .q-row:hover { background: color-mix(in oklab, var(--hairline) 50%, transparent); }
+  .q-row.current { background: color-mix(in oklab, var(--accent) 12%, transparent); }
+  .q-row.current .q-title { color: var(--accent); }
   .q-text { flex: 1; min-width: 0; }
   .q-title {
     font-size: 12px; font-family: var(--font-oswald); text-transform: uppercase;
@@ -549,8 +669,21 @@
     line-height: 1.55; font-size: 14px; color: var(--ink);
   }
 
-  /* On narrow screens, drop the dock (mobile handling is a follow-up). */
+  /* On narrow screens the dock becomes a full-screen now-playing sheet that
+     slides up from the bottom, toggled by the mini player. */
   @media (max-width: 900px) {
-    .dock { display: none; }
+    .dock {
+      position: fixed; inset: 0; z-index: 60;
+      width: 100%; height: 100svh;
+      border-left: none;
+      overflow-y: auto;
+      padding-bottom: env(safe-area-inset-bottom, 0px);
+      transform: translateY(100%);
+      transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1);
+      will-change: transform;
+    }
+    .dock.open { transform: translateY(0); }
+    .close-btn { display: flex; }
+    header { padding-top: calc(14px + env(safe-area-inset-top, 0px)); }
   }
 </style>

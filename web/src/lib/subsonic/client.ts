@@ -93,13 +93,27 @@ export class SubsonicClient {
     return r.searchResult3 ?? {}
   }
 
-  /** Every song (server-paged) — Navidrome returns all songs for empty query. */
+  /** Every song (server-paged). Navidrome returns songs alphabetically by title
+   * for empty query and honours `songCount` — a freshly-added track past that
+   * cut-off is invisible here. Pair with `recentlyAddedSongs()` for guaranteed
+   * coverage of new additions. */
   async allSongs(size = 500, offset = 0): Promise<Song[]> {
     const r = await this.send<any>('search3.view', {
       query: '', songCount: size, songOffset: offset,
       albumCount: 0, artistCount: 0,
     })
     return r.searchResult3?.song ?? []
+  }
+
+  /** Songs from the most recently-added `albumCount` albums, fetched in
+   * parallel. Guaranteed to include new arrivals — use alongside `allSongs()`
+   * to work around its alphabetical truncation. */
+  async recentlyAddedSongs(albumCount = 30): Promise<Song[]> {
+    const albums = await this.albumList('newest', albumCount)
+    const perAlbum = await Promise.all(
+      albums.map((a) => this.album(a.id).then((x) => x?.song ?? []).catch(() => [] as Song[])),
+    )
+    return perAlbum.flat()
   }
 
   async genres(): Promise<Genre[]> {
@@ -254,17 +268,59 @@ export class SubsonicClient {
     return await resp.json()
   }
 
+  async requestTransfer(holderId: string, targetId: string): Promise<void> {
+    const q = `?u=${encodeURIComponent(this.creds.username)}`
+    const resp = await fetch(`${this.creds.baseURL.replace(/\/$/, '')}/api/devices/${holderId}/request-transfer${q}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target_id: targetId }),
+    })
+    if (!resp.ok) throw new SubsonicAPIError(resp.status)
+  }
+
   async transferPlayback(
     targetId: string, sourceId: string | null,
     song: DeviceSong, position: number,
+    queue?: DeviceSong[], index?: number,
   ): Promise<void> {
     const q = `?u=${encodeURIComponent(this.creds.username)}`
+    const body: Record<string, unknown> = {
+      source_id: sourceId, song, position,
+    }
+    if (queue && queue.length > 0) {
+      body.queue = queue
+      body.index = index ?? 0
+    }
     const resp = await fetch(`${this.creds.baseURL.replace(/\/$/, '')}/api/devices/${targetId}/transfer${q}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source_id: sourceId, song, position }),
+      body: JSON.stringify(body),
     })
     if (!resp.ok) throw new SubsonicAPIError(resp.status)
+  }
+
+  // ─── Guest Request ─────────────────────────────────────────
+
+  /** Mint a guest-session token bound to this host device. Returns the token
+   *  and its absolute expiry (unix seconds). */
+  async createGuestSession(hostDeviceId: string): Promise<{ token: string; expiresAt: number }> {
+    const q = `?u=${encodeURIComponent(this.creds.username)}`
+    const resp = await fetch(`${this.creds.baseURL.replace(/\/$/, '')}/api/guest/session${q}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: hostDeviceId }),
+    })
+    if (!resp.ok) throw new SubsonicAPIError(resp.status)
+    return await resp.json()
+  }
+
+  /** End an active guest session. */
+  async revokeGuestSession(token: string): Promise<void> {
+    const q = `?u=${encodeURIComponent(this.creds.username)}`
+    const resp = await fetch(`${this.creds.baseURL.replace(/\/$/, '')}/api/guest/session/${encodeURIComponent(token)}${q}`, {
+      method: 'DELETE',
+    })
+    if (!resp.ok && resp.status !== 404) throw new SubsonicAPIError(resp.status)
   }
 
   async downloadStatus(downloadId: string): Promise<DownloadStatus> {

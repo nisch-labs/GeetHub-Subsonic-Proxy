@@ -54,18 +54,43 @@ def list_for(user: str) -> list[dict]:
 
 
 def transfer(user: str, target_id: str, source_id: str | None,
-             song: Any, position: float) -> bool:
+             song: Any, position: float,
+             queue: list | None = None, index: int | None = None) -> bool:
     """Queue a `play(song, position)` command for the target device and,
     if the source device is known, a matching `pause` command for the
-    source. Returns True if the target is known."""
+    source. Returns True if the target is known.
+
+    Newer clients also send the caller's full `queue` and current `index`
+    so the target can restore the whole up-next list rather than a one-song
+    stub. Older clients omit them — the receiver falls back to `song` alone.
+    """
+    _prune()
+    if (user, target_id) not in _devices:
+        return False
+    cmd: dict[str, Any] = {
+        "type": "play", "song": song, "position": float(position or 0),
+    }
+    if queue is not None:
+        cmd["queue"] = queue
+        cmd["index"] = int(index or 0)
+    _commands.setdefault((user, target_id), []).append(cmd)
+    if source_id and (user, source_id) in _devices:
+        _commands.setdefault((user, source_id), []).append({"type": "pause"})
+    return True
+
+
+def replace_now_playing(user: str, target_id: str, song: Any) -> bool:
+    """Queue a ``replaceNowPlaying`` command for ``target_id``. The receiving
+    client swaps its current now-playing slot for ``song`` and leaves the rest
+    of the queue intact. Powers the Guest Request "tap = play on host" flow.
+    Returns True if the target is known.
+    """
     _prune()
     if (user, target_id) not in _devices:
         return False
     _commands.setdefault((user, target_id), []).append({
-        "type": "play", "song": song, "position": float(position or 0),
+        "type": "replaceNowPlaying", "song": song,
     })
-    if source_id and (user, source_id) in _devices:
-        _commands.setdefault((user, source_id), []).append({"type": "pause"})
     return True
 
 
@@ -74,3 +99,20 @@ def poll_commands(user: str, device_id: str) -> list[dict]:
     calls with no new commands return []."""
     cmds = _commands.pop((user, device_id), [])
     return cmds
+
+
+def request_transfer(user: str, holder_id: str, target_id: str) -> bool:
+    """Ask the current playback holder to transfer to `target_id` (the caller).
+
+    The holder handles it on its next poll: it looks up its own queue and
+    invokes its normal `transferPlayback(target_id)` path, which sends a
+    `play` command with the full queue attached. Two poll cycles = ~3s
+    end-to-end latency but preserves the up-next list.
+    """
+    _prune()
+    if (user, holder_id) not in _devices:
+        return False
+    _commands.setdefault((user, holder_id), []).append({
+        "type": "transferTo", "target_id": target_id,
+    })
+    return True

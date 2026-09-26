@@ -4,6 +4,7 @@
   import { playlistFavs } from '../stores/playlistFavs'
   import { navigate } from '../stores/router'
   import type { Song, Album, Artist, Playlist } from '../subsonic/models'
+  import { virtualSource } from '../subsonic/models'
   import Artwork from '../components/Artwork.svelte'
   import SectionHeader from '../components/SectionHeader.svelte'
   import SegmentedBar from '../components/SegmentedBar.svelte'
@@ -25,6 +26,13 @@
   let sort = $state<Sort>('title')
   let sortOpen = $state(false)
 
+  // Per-tab search — kept independent so switching tabs doesn't lose your
+  // in-progress query. Placeholder is tab-scoped so the affordance is clear.
+  let songQuery = $state('')
+  let playlistQuery = $state('')
+  let albumQuery = $state('')
+  let artistQuery = $state('')
+
   let songs = $state<Song[]>([])
   let playlists = $state<Playlist[]>([])
   let albums = $state<Album[]>([])
@@ -33,18 +41,75 @@
 
   onMount(async () => {
     const c = requireClient()
-    const [s, p, a, ar] = await Promise.all([
+    // Alphabetical `allSongs` truncates at 500 — freshly-added tracks past
+    // that cut-off would be invisible here. Merge with a "recently added"
+    // fetch that walks the newest albums to guarantee coverage.
+    const [alphabet, recent, p, a, ar] = await Promise.all([
       c.allSongs(500).catch(() => [] as Song[]),
+      c.recentlyAddedSongs(30).catch(() => [] as Song[]),
       c.playlists().catch(() => [] as Playlist[]),
       c.albumList('alphabeticalByName', 200).catch(() => [] as Album[]),
       c.artists().catch(() => [] as Artist[]),
     ])
-    songs = s; playlists = p; albums = a; artists = ar
+    const byId = new Map<string, Song>()
+    for (const s of alphabet) byId.set(s.id, s)
+    // Prefer the album-walk version on collision — its metadata is fresher.
+    for (const s of recent) byId.set(s.id, s)
+    songs = Array.from(byId.values())
+    playlists = p; albums = a; artists = ar
     loading = false
   })
 
+  function norm(s: string | null | undefined): string {
+    return (s ?? '').toLowerCase()
+  }
+
+  // Server-side song search — hits search3.view so results include tracks
+  // beyond `allSongs`' alphabetical cap AND freshly-scanned downloads.
+  let songSearchResults = $state<Song[]>([])
+  let songSearchToken: number | null = null
+
+  $effect(() => {
+    const q = songQuery.trim()
+    if (songSearchToken !== null) clearTimeout(songSearchToken)
+    if (!q) { songSearchResults = []; return }
+    songSearchToken = window.setTimeout(async () => {
+      const c = requireClient()
+      const r = await c.search(q, { artistCount: 0, albumCount: 0, songCount: 100 }).catch(() => null)
+      // Strip virtuals (yt-/ytm-) — the proxy augments search3 with YouTube
+      // results by default and Library search is real-tracks-only.
+      songSearchResults = (r?.song ?? []).filter((s) => !virtualSource(s.id))
+    }, 300)
+  })
+
+  const filteredSongs = $derived.by(() => {
+    const q = songQuery.trim()
+    // With a query, trust the server's results — they cover the whole library.
+    if (q) return songSearchResults
+    return songs
+  })
+
+  const filteredPlaylists = $derived.by(() => {
+    const q = playlistQuery.trim().toLowerCase()
+    if (!q) return playlists
+    return playlists.filter((p) => norm(p.name).includes(q))
+  })
+
+  const filteredAlbums = $derived.by(() => {
+    const q = albumQuery.trim().toLowerCase()
+    if (!q) return albums
+    return albums.filter((a) =>
+      norm(a.name).includes(q) || norm(a.artist).includes(q))
+  })
+
+  const filteredArtists = $derived.by(() => {
+    const q = artistQuery.trim().toLowerCase()
+    if (!q) return artists
+    return artists.filter((a) => norm(a.name).includes(q))
+  })
+
   const sortedSongs = $derived.by(() => {
-    const list = [...songs]
+    const list = [...filteredSongs]
     switch (sort) {
       case 'title':    return list.sort((a, b) => a.title.localeCompare(b.title))
       case 'artist':   return list.sort((a, b) => (a.artist ?? '').localeCompare(b.artist ?? ''))
@@ -53,6 +118,29 @@
       case 'duration': return list.sort((a, b) => (a.duration ?? 0) - (b.duration ?? 0))
     }
   })
+
+  const currentPlaceholder = $derived(
+    tab === 0 ? 'Search songs' :
+    tab === 1 ? 'Search playlists' :
+    tab === 2 ? 'Search albums' :
+                'Search artists',
+  )
+
+  const currentQuery = $derived(
+    tab === 0 ? songQuery
+    : tab === 1 ? playlistQuery
+    : tab === 2 ? albumQuery
+    : artistQuery,
+  )
+
+  function setQuery(v: string) {
+    if (tab === 0) songQuery = v
+    else if (tab === 1) playlistQuery = v
+    else if (tab === 2) albumQuery = v
+    else artistQuery = v
+  }
+
+  function clearQuery() { setQuery('') }
 </script>
 
 <div class="library">
@@ -82,79 +170,112 @@
   <SegmentedBar options={['Songs', 'Playlists', 'Albums', 'Artists']} selected={tab}
                 onselect={(i) => tab = i} />
 
+  <div class="search-wrap">
+    <div class="field">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="var(--graphite)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="7" />
+        <path d="m20 20-3.5-3.5" />
+      </svg>
+      <input type="text" placeholder={currentPlaceholder} value={currentQuery}
+             oninput={(e) => setQuery((e.currentTarget as HTMLInputElement).value)}
+             autocomplete="off" autocapitalize="none" spellcheck="false" />
+      {#if currentQuery}
+        <button class="clear" onclick={clearQuery} aria-label="Clear">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="var(--graphite)"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm3.5 13.5-3.5-3.5-3.5 3.5-1-1 3.5-3.5-3.5-3.5 1-1 3.5 3.5 3.5-3.5 1 1-3.5 3.5 3.5 3.5z" /></svg>
+        </button>
+      {/if}
+    </div>
+  </div>
+
   <div class="body">
     {#if loading}
       <div class="empty retro retro-sm retro-light retro-graphite">Loading…</div>
     {:else if tab === 0}
-      <SongList songs={sortedSongs} />
+      {#if sortedSongs.length === 0 && songQuery}
+        <div class="empty retro retro-sm retro-light retro-graphite">No songs match "{songQuery}"</div>
+      {:else}
+        <SongList songs={sortedSongs} />
+      {/if}
     {:else if tab === 1}
-      <ul class="rows">
-        {#each playlists as p}
-          {@const fav = $playlistFavs.has(p.id)}
-          <li>
-            <div class="row playlist-row">
-              <button class="row-body" onclick={() => navigate({ name: 'playlist', id: p.id })}>
-                {#if p.coverArt}
-                  <Artwork coverArt={p.coverArt} size={44} corner={5} />
-                {:else}
-                  <div class="placeholder">
-                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="var(--graphite)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
-                    </svg>
+      {#if filteredPlaylists.length === 0 && playlistQuery}
+        <div class="empty retro retro-sm retro-light retro-graphite">No playlists match "{playlistQuery}"</div>
+      {:else}
+        <ul class="rows">
+          {#each filteredPlaylists as p}
+            {@const fav = $playlistFavs.has(p.id)}
+            <li>
+              <div class="row playlist-row">
+                <button class="row-body" onclick={() => navigate({ name: 'playlist', id: p.id })}>
+                  {#if p.coverArt}
+                    <Artwork coverArt={p.coverArt} size={44} corner={5} />
+                  {:else}
+                    <div class="placeholder">
+                      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="var(--graphite)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
+                      </svg>
+                    </div>
+                  {/if}
+                  <div class="text">
+                    <div class="retro row-title">{p.name}</div>
+                    {#if p.songCount != null}
+                      <div class="retro retro-light retro-graphite row-sub">{p.songCount} songs</div>
+                    {/if}
                   </div>
-                {/if}
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="var(--graphite)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+                </button>
+                <button class="fav-btn" onclick={() => playlistFavs.toggle(p.id)}
+                        aria-label={fav ? 'Unfavourite playlist' : 'Favourite playlist'}>
+                  <svg viewBox="0 0 24 24" width="18" height="18"
+                       fill={fav ? 'var(--accent)' : 'none'}
+                       stroke={fav ? 'var(--accent)' : 'var(--graphite)'}
+                       stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 21s-7-4.5-9.5-9A5 5 0 0 1 12 6a5 5 0 0 1 9.5 6C19 16.5 12 21 12 21z" />
+                  </svg>
+                </button>
+              </div>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    {:else if tab === 2}
+      {#if filteredAlbums.length === 0 && albumQuery}
+        <div class="empty retro retro-sm retro-light retro-graphite">No albums match "{albumQuery}"</div>
+      {:else}
+        <div class="grid">
+          {#each filteredAlbums as a}
+            <button class="cell" onclick={() => navigate({ name: 'album', id: a.id })}>
+              <Artwork coverArt={a.coverArt} size={150} corner={8} />
+              <div class="retro cell-title">{a.name}</div>
+              <div class="retro retro-light retro-graphite cell-sub">{a.artist ?? ''}</div>
+            </button>
+          {/each}
+        </div>
+      {/if}
+    {:else}
+      {#if filteredArtists.length === 0 && artistQuery}
+        <div class="empty retro retro-sm retro-light retro-graphite">No artists match "{artistQuery}"</div>
+      {:else}
+        <ul class="rows">
+          {#each filteredArtists as a}
+            <li>
+              <button class="row" onclick={() => navigate({ name: 'artist', id: a.id })}>
+                <div class="artist-circle">
+                  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="var(--graphite)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 3a4 4 0 1 1 0 8 4 4 0 0 1 0-8zm-6 18a6 6 0 0 1 12 0" />
+                  </svg>
+                </div>
                 <div class="text">
-                  <div class="retro row-title">{p.name}</div>
-                  {#if p.songCount != null}
-                    <div class="retro retro-light retro-graphite row-sub">{p.songCount} songs</div>
+                  <div class="retro row-title">{a.name}</div>
+                  {#if a.albumCount != null}
+                    <div class="retro retro-light retro-graphite row-sub">{a.albumCount} albums</div>
                   {/if}
                 </div>
                 <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="var(--graphite)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
               </button>
-              <button class="fav-btn" onclick={() => playlistFavs.toggle(p.id)}
-                      aria-label={fav ? 'Unfavourite playlist' : 'Favourite playlist'}>
-                <svg viewBox="0 0 24 24" width="18" height="18"
-                     fill={fav ? 'var(--accent)' : 'none'}
-                     stroke={fav ? 'var(--accent)' : 'var(--graphite)'}
-                     stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 21s-7-4.5-9.5-9A5 5 0 0 1 12 6a5 5 0 0 1 9.5 6C19 16.5 12 21 12 21z" />
-                </svg>
-              </button>
-            </div>
-          </li>
-        {/each}
-      </ul>
-    {:else if tab === 2}
-      <div class="grid">
-        {#each albums as a}
-          <button class="cell" onclick={() => navigate({ name: 'album', id: a.id })}>
-            <Artwork coverArt={a.coverArt} size={150} corner={8} />
-            <div class="retro cell-title">{a.name}</div>
-            <div class="retro retro-light retro-graphite cell-sub">{a.artist ?? ''}</div>
-          </button>
-        {/each}
-      </div>
-    {:else}
-      <ul class="rows">
-        {#each artists as a}
-          <li>
-            <button class="row" onclick={() => navigate({ name: 'artist', id: a.id })}>
-              <div class="artist-circle">
-                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="var(--graphite)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 3a4 4 0 1 1 0 8 4 4 0 0 1 0-8zm-6 18a6 6 0 0 1 12 0" />
-                </svg>
-              </div>
-              <div class="text">
-                <div class="retro row-title">{a.name}</div>
-                {#if a.albumCount != null}
-                  <div class="retro retro-light retro-graphite row-sub">{a.albumCount} albums</div>
-                {/if}
-              </div>
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="var(--graphite)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
-            </button>
-          </li>
-        {/each}
-      </ul>
+            </li>
+          {/each}
+        </ul>
+      {/if}
     {/if}
   </div>
 </div>
@@ -190,6 +311,22 @@
   }
   .mi:hover { background: color-mix(in oklab, var(--hairline) 60%, transparent); }
   .mi.on { color: var(--accent); }
+
+  .search-wrap { padding: 0 20px; }
+  .field {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px;
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: 10px;
+  }
+  .field > input {
+    flex: 1; font-size: 14px; color: var(--ink);
+    background: transparent; border: 0; outline: 0;
+    font-family: inherit;
+  }
+  .field > input::placeholder { color: var(--graphite); }
+  .clear { display: flex; align-items: center; justify-content: center; }
 
   .body { flex: 1; overflow-y: auto; }
 

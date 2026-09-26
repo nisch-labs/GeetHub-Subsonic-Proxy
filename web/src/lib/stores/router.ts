@@ -17,6 +17,7 @@ export type Route =
   | { name: 'album'; id: string }
   | { name: 'artist'; id: string }
   | { name: 'playlist'; id: string }
+  | { name: 'guest'; token: string }
 
 function fromHash(hash: string): Route {
   const raw = hash.replace(/^#\/?/, '')
@@ -45,10 +46,19 @@ function toHash(r: Route): string {
     case 'album':      return `#/album/${r.id}`
     case 'artist':     return `#/artist/${r.id}`
     case 'playlist':   return `#/playlist/${r.id}`
+    case 'guest':      return `/guest/${r.token}`
   }
 }
 
-export const route = writable<Route>(fromHash(location.hash))
+/** Guest URLs are path-based (`/guest/<token>`) rather than hash-based so a
+ * passenger scanning a QR sees a clean URL. Detect at boot and bypass the
+ * usual hash router — guests are terminal, they never navigate elsewhere. */
+function guestFromPath(): Route | null {
+  const m = location.pathname.match(/^\/guest\/([^\/?#]+)/)
+  return m ? { name: 'guest', token: decodeURIComponent(m[1]) } : null
+}
+
+export const route = writable<Route>(guestFromPath() ?? fromHash(location.hash))
 
 export function navigate(next: Route, push = true) {
   const hash = toHash(next)

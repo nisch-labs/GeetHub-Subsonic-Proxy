@@ -160,7 +160,7 @@
         {#each songs as s, i}
           <li>
             <div class="hit">
-              <button class="hit-body" onclick={() => { addRecent(query); player.play(songs, i) }}>
+              <button class="hit-body" onclick={() => { addRecent(query); player.replaceNowPlaying(s) }}>
                 <Artwork coverArt={s.coverArt} size={44} corner={5} />
                 <div class="text">
                   <div class="retro title">{s.title}</div>

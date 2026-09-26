@@ -1,14 +1,11 @@
 import { defineConfig } from 'vite'
 import { svelte } from '@sveltejs/vite-plugin-svelte'
 
-// During dev, forward Subsonic + our custom endpoints to a running
+// During dev, forward Subsonic + our custom endpoints to the production
 // subsonic-proxy so the web app talks to the real Navidrome/Antra pipeline
 // without needing CORS. In production the frontend is served from the
 // same FastAPI process, so calls are same-origin naturally.
-//
-// Override for your own deployment: `VITE_UPSTREAM=https://... npm run dev`
-// or set it in a local `.env` file (which is gitignored).
-const UPSTREAM = process.env.VITE_UPSTREAM ?? 'http://localhost:4544'
+const UPSTREAM = 'https://musicv2.nixsocket.com'
 
 export default defineConfig({
   plugins: [svelte()],

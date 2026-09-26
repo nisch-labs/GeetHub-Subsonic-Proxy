@@ -12,13 +12,17 @@
   import AlbumDetail from './lib/pages/AlbumDetail.svelte'
   import ArtistDetail from './lib/pages/ArtistDetail.svelte'
   import PlaylistDetail from './lib/pages/PlaylistDetail.svelte'
+  import GuestRequest from './lib/pages/GuestRequest.svelte'
   import TabBar from './lib/components/TabBar.svelte'
   import PlayerDock from './lib/components/PlayerDock.svelte'
+  import MiniPlayer from './lib/components/MiniPlayer.svelte'
 
   void theme    // pin the import so tree-shaking keeps the side effects
 </script>
 
-{#if $session.state.kind !== 'connected'}
+{#if $route.name === 'guest'}
+  <GuestRequest token={$route.token} />
+{:else if $session.state.kind !== 'connected'}
   <Login />
 {:else}
   <main class="shell">
@@ -44,6 +48,7 @@
         <PlaylistDetail id={$route.id} />
       {/if}
     </div>
+    <MiniPlayer />
     <PlayerDock />
   </main>
 {/if}
@@ -59,9 +64,12 @@
     display: flex; flex-direction: column; align-items: center; gap: 8px;
   }
 
-  @media (max-width: 720px) {
+  /* Mobile / narrow: stack as a column — content on top, mini player, then the
+     bottom nav. Matches the 900px breakpoint where the PlayerDock sidebar drops
+     out in favour of the mini bar + full-screen sheet. */
+  @media (max-width: 900px) {
     .shell { flex-direction: column; }
     .content { order: 0; }
-    :global(nav.sidebar) { order: 1; }
+    :global(nav.sidebar) { order: 2; }
   }
 </style>

@@ -157,11 +157,12 @@
   .tab.active:hover { background: transparent; }
 
   /* Narrow viewports: collapse to a bottom bar. */
-  @media (max-width: 720px) {
+  @media (max-width: 900px) {
     .sidebar {
       flex-direction: row;
       width: 100%; height: auto;
       padding: 8px 12px;
+      padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
       border-right: none;
       border-top: 1px solid var(--hairline);
       justify-content: center;
