@@ -512,16 +512,21 @@ async function topUpRadio() {
 }
 
 function toggleRadio() {
+  const before = get(store)
+  const turningOn = !before.radioMode
   store.update((s) => {
     const on = !s.radioMode
     saveRadio(on)
+    // Flipping ON while a track is playing: trim everything after the current
+    // slot so radio replaces up-next with similar tracks starting now. This
+    // makes the toggle *visibly* do something instead of quietly arming.
+    if (on && s.queue.length > 0) {
+      const cutQueue = s.queue.slice(0, s.index + 1)
+      return { ...s, radioMode: on, queue: cutQueue, shuffleOrder: null, isShuffled: false }
+    }
     return { ...s, radioMode: on }
   })
-  // Flipping on with a nearly-empty tail should feel instant — top up now.
-  const s = get(store)
-  if (s.radioMode && s.queue.length - s.index - 1 <= RADIO_LOOKAHEAD) {
-    void topUpRadio()
-  }
+  if (turningOn) void topUpRadio()
 }
 
 function previous() {

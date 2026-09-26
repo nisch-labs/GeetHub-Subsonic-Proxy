@@ -107,18 +107,40 @@ async def build_radio(client: httpx.AsyncClient, base: str, query_params,
 
     # Navidrome exposes the recording MBID as ``musicBrainzId`` on the Child.
     mbid = (seed.get("musicBrainzId") or "").strip()
+    seed_artist = seed.get("artist") or ""
+    seed_title = seed.get("title") or ""
     debug.update(seed_mbid=mbid or None,
-                 seed_artist=seed.get("artist"), seed_title=seed.get("title"))
+                 seed_artist=seed_artist, seed_title=seed_title)
 
-    if not mbid:
-        # No MBID → nothing for ListenBrainz to key on. Fall back.
-        debug["skipped"] = "seed has no musicBrainzId"
+    # Build a list of MBIDs to try. If the tag is present, start there. Then
+    # search MusicBrainz for alternative recordings of the same track —
+    # different releases have different MBIDs, and ListenBrainz only has
+    # scrobble data for some of them. We try each until one returns hits.
+    candidates: list[str] = []
+    if mbid:
+        candidates.append(mbid)
+    mb_candidates = await listenbrainz.search_mb_recordings(seed_artist, seed_title, limit=6)
+    for c in mb_candidates:
+        if c not in candidates:
+            candidates.append(c)
+    debug["candidate_mbids"] = candidates[:6]
+    if not candidates:
+        debug["skipped"] = "no MBID (tag missing + MB search empty)"
         return [], debug
 
-    # Ask for extra so we still hit ``count`` after dedupe + local-library misses.
-    recs = await listenbrainz.similar_recordings(mbid, count=max(count * 3, 40))
+    recs: list[dict] = []
+    used_mbid = ""
+    for cand in candidates:
+        # Ask for extra so we still hit ``count`` after dedupe + library misses.
+        rec_batch = await listenbrainz.similar_recordings(cand, count=max(count * 3, 40))
+        if rec_batch:
+            recs = rec_batch
+            used_mbid = cand
+            break
+    debug["seed_mbid_used"] = used_mbid or None
     debug["lb_returned"] = len(recs)
     if not recs:
+        debug["skipped"] = "no ListenBrainz similarities for any candidate MBID"
         return [], debug
 
     songs: list[dict] = []
